@@ -81,6 +81,20 @@ os.environ["STAT_TZ"] = "UTC"
 import komari_traffic_report as k  # noqa: E402
 
 
+class FakeTelegramResponse:
+    def __init__(self, status_code, payload=None, headers=None):
+        self.status_code = status_code
+        self._payload = payload if payload is not None else {"ok": True, "result": []}
+        self.headers = headers or {}
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise k.requests.HTTPError(f"{self.status_code} error", response=self)
+
+    def json(self):
+        return self._payload
+
+
 class CoreTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -193,6 +207,44 @@ class CoreTests(unittest.TestCase):
             if path.name != "tg_offset.txt.tmp"
         ]
         self.assertEqual(leftovers, [])
+
+    def test_get_updates_retries_temporary_502(self):
+        calls = []
+        responses = [
+            FakeTelegramResponse(502),
+            FakeTelegramResponse(200, {"ok": True, "result": [{"update_id": 7}]}),
+        ]
+
+        def fake_get(url, params, timeout):
+            calls.append((url, params, timeout))
+            return responses.pop(0)
+
+        self.patch_attr("TELEGRAM_BOT_TOKEN", "token")
+        with patch.object(k.requests, "get", side_effect=fake_get), \
+             patch.object(k.time, "sleep") as sleep_mock, \
+             patch.object(k.random, "random", return_value=0):
+            data = k.get_updates(123)
+
+        self.assertEqual(data["result"][0]["update_id"], 7)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0][1], {"timeout": 50, "offset": 123})
+        sleep_mock.assert_called_once_with(1.0)
+
+    def test_get_updates_409_conflict_is_not_retried(self):
+        sent = []
+
+        self.patch_attr("TELEGRAM_BOT_TOKEN", "token")
+        self.patch_attr("safe_telegram_send", lambda text: sent.append(text))
+        self.patch_attr("should_alert", lambda _key, _seconds: True)
+
+        with patch.object(k.requests, "get", return_value=FakeTelegramResponse(409)), \
+             patch.object(k.time, "sleep") as sleep_mock:
+            with self.assertRaises(k.requests.HTTPError):
+                k.get_updates(None)
+
+        self.assertEqual(len(sent), 1)
+        self.assertIn("409 Conflict", sent[0])
+        sleep_mock.assert_not_called()
 
     def test_silence_window_supports_cross_midnight(self):
         late = datetime(2026, 6, 6, 23, 30, tzinfo=k.TZ)

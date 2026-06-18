@@ -4777,9 +4777,26 @@ def get_updates(offset: int | None):
             r.raise_for_status()
             return r.json()
         except requests.HTTPError as e:
-            if e.response is not None and e.response.status_code == 409:
+            status_code = e.response.status_code if e.response is not None else None
+            if status_code == 409:
                 if should_alert("tg_409", 600):
                     safe_telegram_send("⚠️ Telegram 409 Conflict：可能有另一份实例在拉 getUpdates，请确认旧环境是否已停止。")
+                raise
+            if status_code in (429, 500, 502, 503, 504):
+                last_exc = e
+                retry_after = None
+                if e.response is not None:
+                    retry_after = e.response.headers.get("Retry-After")
+                sleep_seconds = backoff + random.random()
+                if retry_after:
+                    try:
+                        sleep_seconds = max(sleep_seconds, min(float(retry_after), 60.0))
+                    except ValueError:
+                        pass
+                logging.warning("Telegram getUpdates temporary HTTP %s; retrying", status_code)
+                time.sleep(sleep_seconds)
+                backoff = min(backoff * 2, 20.0)
+                continue
             raise
         except (requests.exceptions.ConnectionError,
                 requests.exceptions.ReadTimeout,
