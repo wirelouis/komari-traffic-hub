@@ -355,7 +355,9 @@ function clearRouteSkeleton() {
 
 async function api(path, options = {}) {
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 15000);
+  // AI 相关接口需要更长的超时时间，默认 15 秒适用于普通接口
+  const timeout = options.timeout !== undefined ? options.timeout : 15000;
+  const timeoutId = setTimeout(() => controller.abort(), timeout);
   const callToken = options.token;
 
   try {
@@ -1737,7 +1739,7 @@ function renderAiStatus(data) {
     miniCard("数据覆盖", sources.length ? `${sources.length} 个窗口` : "未生成", failedSources.length ? `${failedSources.length} 个窗口失败` : "默认隐藏正常窗口", failedSources.length ? "warn" : ""),
   ].join("");
   if (!sources.length) {
-    $("ai-sources").innerHTML = `<div class="quiet-state">还没有生成数据包，点击左侧“刷新数据包”后再查看。</div>`;
+    $("ai-sources").innerHTML = `<div class="quiet-state">还没有生成数据包，点击左侧"刷新数据包"后再查看。</div>`;
     return;
   }
   $("ai-sources").innerHTML = failedSources.length
@@ -1761,7 +1763,11 @@ async function loadAiStatus() {
       state.aiAutoRefreshed = true;
       $("ai-answer").textContent = "数据包已过期,自动刷新中...";
       try {
-        const refreshed = await postJson("/api/ai/refresh", {});
+        const refreshed = await api("/api/ai/refresh", {
+          method: "POST",
+          body: JSON.stringify({}),
+          timeout: 90000, // AI 自动刷新需要 90 秒超时
+        });
         renderAiStatus(refreshed);
         $("ai-answer").textContent = "数据包已自动刷新。";
       } catch (error) {
@@ -1771,6 +1777,83 @@ async function loadAiStatus() {
   } catch (error) {
     $("ai-sources").innerHTML = `<div class="empty-state">${escapeHtml(error.message)}</div>`;
   }
+  await loadAiHistory();
+}
+
+async function loadAiHistory() {
+  const historyList = $("ai-history-list");
+  if (!historyList) return;
+
+  setSkel("ai-history-list", skelRows(3));
+  try {
+    const data = await api("/api/ai/history");
+    const items = data.items || [];
+
+    if (!items.length) {
+      historyList.innerHTML = `<div class="quiet-state">暂无问答历史。</div>`;
+      return;
+    }
+
+    historyList.innerHTML = items.map((item, index) => {
+      const answerId = `ai-history-answer-${index}`;
+      const answerText = stripHtml(item.answer || "");
+      const isLong = answerText.length > 200;
+      const shortAnswer = isLong ? answerText.substring(0, 200) + "..." : answerText;
+
+      return `
+        <div class="history-row">
+          <div class="history-question">
+            <strong>${escapeHtml(item.question || "")}</strong>
+            <span class="history-time">${escapeHtml(item.created_at_text || "")}</span>
+          </div>
+          <div class="history-answer ${isLong ? 'collapsible' : ''}" id="${answerId}">
+            <div class="history-answer-text">${escapeHtml(shortAnswer)}</div>
+            ${isLong ? `
+              <button class="history-expand-btn ghost-btn" data-target="${answerId}" data-full="${escapeHtml(answerText)}" data-short="${escapeHtml(shortAnswer)}">
+                展开完整答案
+              </button>
+            ` : ''}
+          </div>
+          <button class="ghost-btn history-reask-btn" data-question="${escapeHtml(item.question || '')}">
+            再次提问
+          </button>
+        </div>
+      `;
+    }).join("");
+
+    // Attach event listeners for expand buttons
+    historyList.querySelectorAll(".history-expand-btn").forEach((btn) => {
+      btn.addEventListener("click", toggleHistoryAnswer);
+    });
+
+    // Attach event listeners for reask buttons
+    historyList.querySelectorAll(".history-reask-btn").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const question = btn.dataset.question || "";
+        $("ai-question").value = question;
+        $("ai-answer").textContent = "已填入历史问题，确认后点击\"提问\"。";
+        $("ai-question").focus();
+      });
+    });
+  } catch (error) {
+    historyList.innerHTML = `<div class="empty-state">${escapeHtml(error.message)}</div>`;
+  }
+}
+
+function toggleHistoryAnswer(event) {
+  const btn = event.currentTarget;
+  const targetId = btn.dataset.target;
+  const fullText = btn.dataset.full || "";
+  const shortText = btn.dataset.short || "";
+  const textEl = btn.previousElementSibling;
+
+  if (btn.textContent.trim() === "展开完整答案") {
+    textEl.textContent = fullText;
+    btn.textContent = "收起";
+  } else {
+    textEl.textContent = shortText;
+    btn.textContent = "展开完整答案";
+  }
 }
 
 async function refreshAiPack() {
@@ -1778,7 +1861,11 @@ async function refreshAiPack() {
   state.aiAutoRefreshed = true; // Mark as refreshed to avoid auto-refresh after manual refresh
   $("ai-answer").textContent = "刷新数据包中...";
   try {
-    const data = await postJson("/api/ai/refresh", {});
+    const data = await api("/api/ai/refresh", {
+      method: "POST",
+      body: JSON.stringify({}),
+      timeout: 90000, // AI 刷新需要 90 秒超时
+    });
     renderAiStatus(data);
     $("ai-answer").textContent = "AI 数据包已刷新。";
   } catch (error) {
@@ -1789,7 +1876,6 @@ async function refreshAiPack() {
 function setAiBusy(busy) {
   state.aiAsking = Boolean(busy);
   $("ai-ask-btn").disabled = state.aiAsking;
-  $("ai-refresh-btn").disabled = state.aiAsking;
   document.querySelectorAll(".ai-prompt").forEach((button) => {
     button.disabled = state.aiAsking;
   });
@@ -1800,7 +1886,7 @@ function fillAiPrompt(button) {
   $("ai-question").value = button.dataset.question || "";
   document.querySelectorAll(".ai-prompt").forEach((item) => item.classList.remove("active"));
   button.classList.add("active");
-  $("ai-answer").textContent = "已填入快捷问题，确认后点击“提问”。";
+  $("ai-answer").textContent = "已填入快捷问题，确认后点击\"提问\"。";
   $("ai-question").focus();
 }
 
@@ -1812,15 +1898,40 @@ async function askAi() {
     return;
   }
   $("ai-question").value = value;
-  $("ai-answer").textContent = "分析中...";
   setAiBusy(true);
+
   try {
+    // Check if data pack is expired before asking
+    $("ai-answer").textContent = "检查数据包状态...";
+    const status = await api("/api/ai/status");
+
+    if (!status.cache_valid) {
+      // Auto-refresh expired data pack
+      $("ai-answer").textContent = "数据包已过期，正在更新数据...";
+      try {
+        await api("/api/ai/refresh", {
+          method: "POST",
+          body: JSON.stringify({}),
+          timeout: 90000,
+        });
+        renderAiStatus(await api("/api/ai/status"));
+      } catch (error) {
+        $("ai-answer").textContent = `数据包刷新失败: ${friendlyError(error.message)}`;
+        setAiBusy(false);
+        return;
+      }
+    }
+
+    // Now ask the question
+    $("ai-answer").textContent = "分析中...";
     const data = await api("/api/ai/ask", {
       method: "POST",
       body: JSON.stringify({ question: value }),
+      timeout: 90000,
     });
     $("ai-answer").textContent = stripHtml(data.answer || "");
     await loadAiStatus();
+    await loadAiHistory();
   } catch (error) {
     $("ai-answer").textContent = friendlyError(error.message);
   } finally {
@@ -2480,10 +2591,16 @@ function bindEvents() {
       $("telegram-result").textContent = friendlyError(error.message);
     }
   });
-  $("ai-refresh-btn").addEventListener("click", refreshAiPack);
   $("ai-ask-btn").addEventListener("click", () => askAi());
   document.querySelectorAll(".ai-prompt").forEach((button) => {
     button.addEventListener("click", () => fillAiPrompt(button));
+  });
+  $("ai-history-toggle").addEventListener("click", () => {
+    const toggle = $("ai-history-toggle");
+    const body = $("ai-history-body");
+    const expanded = toggle.getAttribute("aria-expanded") === "true";
+    toggle.setAttribute("aria-expanded", !expanded);
+    body.hidden = expanded;
   });
   $("load-traffic-range-btn").addEventListener("click", loadTrafficRange);
   $("export-traffic-range-btn").addEventListener("click", exportTrafficRangeCsv);

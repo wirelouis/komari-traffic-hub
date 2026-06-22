@@ -4,8 +4,8 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Komari Traffic Console</title>
-  <link rel="icon" type="image/svg+xml" href="/static/komari-traffic-icon.svg?v=20260612-ai-auto-refresh">
-  <link rel="stylesheet" href="/static/styles.css?v=20260612-ai-auto-refresh">
+  <link rel="icon" type="image/svg+xml" href="/static/komari-traffic-icon.svg?v=20260622-ai-history">
+  <link rel="stylesheet" href="/static/styles.css?v=20260622-ai-history">
 </head>
 <body>
   <div id="route-progress" class="route-progress" aria-hidden="true"></div>
@@ -13,7 +13,7 @@
     <section class="login-panel">
       <div class="login-brand">
         <span class="brand-mark">
-          <img class="brand-icon" src="/static/komari-traffic-icon.svg?v=20260612-ai-auto-refresh" alt="">
+          <img class="brand-icon" src="/static/komari-traffic-icon.svg?v=20260622-ai-history" alt="">
           <span class="brand-fallback" hidden>K</span>
         </span>
         <div>
@@ -46,7 +46,7 @@
       <div class="sidebar-head">
         <a class="brand" href="/" data-route="/" aria-label="Komari Traffic 总览">
           <span class="brand-mark">
-            <img class="brand-icon" src="/static/komari-traffic-icon.svg?v=20260612-ai-auto-refresh" alt="">
+            <img class="brand-icon" src="/static/komari-traffic-icon.svg?v=20260622-ai-history" alt="">
             <span class="brand-fallback" hidden>K</span>
           </span>
           <span class="brand-copy">
@@ -397,7 +397,6 @@
                 <div>
                   <h3>快捷分析</h3>
                 </div>
-                <button id="ai-refresh-btn" class="ghost-btn">刷新数据包</button>
               </div>
               <div id="ai-prompts" class="prompt-grid">
                 <button class="ghost-btn ai-prompt" data-question="今天哪个节点流量异常？">今日异常</button>
@@ -420,6 +419,19 @@
               <div id="ai-sources" class="stacked"></div>
             </article>
           </div>
+          <article class="sub-panel">
+            <div class="panel-head">
+              <button id="ai-history-toggle" class="panel-head-toggle" type="button" aria-expanded="false">
+                <svg class="toggle-icon" viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M9 18l6-6-6-6"></path>
+                </svg>
+                <h3>问答历史</h3>
+              </button>
+            </div>
+            <div id="ai-history-body" class="collapsible-body" hidden>
+              <div id="ai-history-list" class="stacked"></div>
+            </div>
+          </article>
         </section>
       </section>
 
@@ -518,6 +530,6 @@
 
   <div id="toast-container"></div>
 
-  <script src="/static/app.js?v=20260612-ai-auto-refresh"></script>
+  <script src="/static/app.js?v=20260622-ai-history"></script>
 </body>
 </html>

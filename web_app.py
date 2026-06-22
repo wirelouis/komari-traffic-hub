@@ -1806,5 +1806,42 @@ def ai_ask(req: AiAskRequest, _user: str = Depends(current_user)):
     if not k.ai_enabled():
         return api_error("AI is not configured", status_code=400, code="ai_disabled")
     data_pack = k.build_ai_data_pack() if k.question_requires_fresh_ai_pack(question) else k.get_ai_data_pack_cached()
+
+    start_time = time.time()
     answer = k.normalize_ai_answer_for_telegram(k.ask_ai_with_data(question, data_pack))
+    duration_ms = int((time.time() - start_time) * 1000)
+
+    try:
+        data_pack_hash = k.get_ai_data_pack_hash(data_pack)
+        k.save_ai_qa_record(question, answer, data_pack_hash, duration_ms)
+    except Exception as exc:
+        import logging
+        logging.warning(f"Failed to save AI Q&A record: {exc}")
+
     return api_ok({"answer": answer})
+
+
+@app.get("/api/ai/history")
+def ai_history(
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    _user: str = Depends(current_user)
+):
+    try:
+        history_list = k.list_ai_qa_history(limit=limit, offset=offset)
+        return api_ok({"items": history_list, "total": len(history_list)})
+    except Exception as exc:
+        return api_error(str(exc), status_code=500, code=type(exc).__name__)
+
+
+@app.delete("/api/ai/history")
+def ai_history_clear(
+    days: int = Query(30, ge=1),
+    _user: str = Depends(current_user)
+):
+    try:
+        cutoff_timestamp = int((datetime.now().timestamp() - days * 86400))
+        deleted_count = k.delete_old_ai_qa_records(cutoff_timestamp)
+        return api_ok({"deleted": deleted_count})
+    except Exception as exc:
+        return api_error(str(exc), status_code=500, code=type(exc).__name__)
