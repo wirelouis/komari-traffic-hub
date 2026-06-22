@@ -373,3 +373,9 @@ For highly time-sensitive questions such as “the last hour” or “today by h
 ### About TELEGRAM_ALLOWED_CHAT_IDS / TELEGRAM_ADMIN_CHAT_IDS
 
 Both variables can be left empty; they fallback to `TELEGRAM_CHAT_ID`, so the bot can still receive commands by default.
+
+## 🔗 Acknowledgements
+
+This project is shared with support from the LINUX DO community.
+
+[![LINUX DO](https://img.shields.io/badge/COMMUNITY-LINUXDO-00AEEF?style=for-the-badge&labelColor=555555)](https://linux.do)
