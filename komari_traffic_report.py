@@ -12,6 +12,7 @@ import traceback
 import socket
 import gzip
 import html
+import hashlib
 import concurrent.futures
 import signal
 import secrets
@@ -776,6 +777,21 @@ def init_traffic_db():
         conn.execute("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(2, ?)", (now_dt().isoformat(),))
         conn.execute("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(3, ?)", (now_dt().isoformat(),))
         conn.execute("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(4, ?)", (now_dt().isoformat(),))
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ai_qa_history (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              question TEXT NOT NULL,
+              answer TEXT NOT NULL,
+              data_pack_hash TEXT NOT NULL DEFAULT '',
+              created_at INTEGER NOT NULL,
+              duration_ms INTEGER NOT NULL DEFAULT 0,
+              metadata TEXT NOT NULL DEFAULT '{}'
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_ai_qa_history_created ON ai_qa_history(created_at DESC)")
+        conn.execute("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(5, ?)", (now_dt().isoformat(),))
     _db_initialized = True
 
 
@@ -1156,6 +1172,133 @@ def run_with_task_record(task_type: str, source: str, func, summary_func=None, m
             metadata=metadata or {},
         )
         raise
+
+
+def get_ai_data_pack_hash(data_pack: dict) -> str:
+    """
+    计算数据包的 MD5 哈希作为指纹，用于标识同一批数据。
+    """
+    try:
+        data_text = json.dumps(data_pack, sort_keys=True, ensure_ascii=False)
+        return hashlib.md5(data_text.encode("utf-8")).hexdigest()
+    except Exception:
+        return ""
+
+
+def save_ai_qa_record(
+    question: str,
+    answer: str,
+    data_pack_hash: str = "",
+    duration_ms: int = 0,
+    metadata: dict | None = None,
+) -> int:
+    """
+    保存 AI 问答记录到数据库。
+
+    参数：
+      - question: 用户问题
+      - answer: AI 回答
+      - data_pack_hash: 数据包哈希（可选）
+      - duration_ms: 响应时长（毫秒）
+      - metadata: 附加元数据（可选）
+
+    返回：
+      - 记录 ID (lastrowid)，失败时返回 0
+    """
+    try:
+        init_traffic_db()
+        created_at = int(time.time())
+        question_text = str(question or "").strip()[:2000]
+        answer_text = str(answer or "").strip()[:10000]
+        hash_text = str(data_pack_hash or "").strip()[:64]
+        duration = max(0, int(duration_ms or 0))
+        metadata_json = _json_dumps_compact(metadata or {})
+
+        with traffic_db_session() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO ai_qa_history(question, answer, data_pack_hash, created_at, duration_ms, metadata)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (question_text, answer_text, hash_text, created_at, duration, metadata_json),
+            )
+            return int(cur.lastrowid)
+    except Exception:
+        logging.exception("failed to save ai_qa_record")
+        return 0
+
+
+def list_ai_qa_history(limit: int = 20, offset: int = 0) -> list[dict]:
+    """
+    查询最近的 AI 问答历史记录。
+
+    参数：
+      - limit: 返回记录数（默认 20）
+      - offset: 跳过记录数（默认 0）
+
+    返回：
+      - list[dict]，包含 id, question, answer, created_at, created_at_text, duration_ms
+    """
+    init_traffic_db()
+    limit = min(200, max(1, int(limit or 20)))
+    offset = max(0, int(offset or 0))
+
+    with traffic_db_session() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, question, answer, data_pack_hash, created_at, duration_ms, metadata
+            FROM ai_qa_history
+            ORDER BY created_at DESC, id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (limit, offset),
+        ).fetchall()
+
+    history = []
+    for row in rows:
+        created_at = int(row["created_at"] or 0)
+        created_at_text = datetime.fromtimestamp(created_at, TZ).strftime("%Y-%m-%d %H:%M:%S %Z") if created_at else ""
+
+        history.append({
+            "id": int(row["id"]),
+            "question": str(row["question"] or ""),
+            "answer": str(row["answer"] or ""),
+            "data_pack_hash": str(row["data_pack_hash"] or ""),
+            "created_at": created_at,
+            "created_at_text": created_at_text,
+            "duration_ms": int(row["duration_ms"] or 0),
+            "metadata": _json_loads_object(row["metadata"]),
+        })
+
+    return history
+
+
+def delete_old_ai_qa_records(cutoff_timestamp: int) -> int:
+    """
+    删除指定时间戳之前的 AI 问答历史记录。
+
+    参数：
+      - cutoff_timestamp: 截止时间戳（Unix timestamp），早于此时间的记录将被删除
+
+    返回：
+      - 删除的记录数
+    """
+    try:
+        init_traffic_db()
+        cutoff = int(cutoff_timestamp or 0)
+
+        with traffic_db_session() as conn:
+            cur = conn.execute(
+                """
+                DELETE FROM ai_qa_history
+                WHERE created_at < ?
+                """,
+                (cutoff,),
+            )
+            return int(cur.rowcount)
+    except Exception:
+        logging.exception("failed to delete old ai_qa_records")
+        return 0
 
 
 def save_traffic_snapshot(ts: int | float, nodes_map: dict, skipped: list[str] | None = None):
