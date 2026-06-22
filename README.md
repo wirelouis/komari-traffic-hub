@@ -439,3 +439,8 @@ docker image inspect ghcr.io/wirelouis/komari-traffic-hub:latest --format '{{.Id
 ### 关于 TELEGRAM_ALLOWED_CHAT_IDS / TELEGRAM_ADMIN_CHAT_IDS
 
 这两个变量可以留空；留空时默认回退为 `TELEGRAM_CHAT_ID`，不会导致 bot 收不到消息。
+## 🔗 Acknowledgements
+
+感谢 LINUX DO 社区提供交流与分享平台。
+
+[![LINUX DO](https://img.shields.io/badge/COMMUNITY-LINUXDO-00AEEF?style=for-the-badge&labelColor=555555)](https://linux.do)
