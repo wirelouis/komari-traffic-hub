@@ -392,6 +392,33 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(k.collect_alert_candidates(state, now_ts=1010), [])
         self.assertEqual(state["node_skips"]["node-a"]["count"], 1)
 
+    def test_node_missing_alert_does_not_repeat_while_still_offline(self):
+        candidate = k._alert_event(
+            "node_missing:node-a",
+            "node_missing",
+            "节点连续采样异常：node-a",
+            "still offline",
+        )
+        state = {"active": {}, "node_skips": {}, "muted_until": 0}
+
+        first = k.apply_alert_candidates(state, [candidate], now_ts=1000)
+        self.assertEqual([event["kind"] for event in first], ["alert"])
+        state["active"]["node_missing:node-a"]["last_sent"] = 1000
+
+        after_cooldown = k.apply_alert_candidates(state, [candidate], now_ts=4000)
+        self.assertEqual(after_cooldown, [])
+
+    def test_traffic_alert_still_repeats_after_cooldown(self):
+        candidate = k._alert_event("window_total", "window_total", "窗口总流量超阈值", "high")
+        state = {"active": {}, "node_skips": {}, "muted_until": 0}
+
+        k.apply_alert_candidates(state, [candidate], now_ts=1000)
+        state["active"]["window_total"]["last_sent"] = 1000
+
+        repeated = k.apply_alert_candidates(state, [candidate], now_ts=2800)
+        self.assertEqual([event["kind"] for event in repeated], ["alert"])
+        self.assertIn("告警仍在持续", repeated[0]["message"])
+
     def test_window_total_alert_and_dry_run_does_not_persist(self):
         self.patch_attr("ALERT_TOTAL_WINDOW_BYTES", 100)
         self.patch_attr("ALERT_WINDOW_MINUTES", 60)

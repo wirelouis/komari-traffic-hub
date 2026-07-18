@@ -643,7 +643,7 @@ def current_runtime_config() -> dict:
             field("node_daily_usage_retention_days", "每日汇总保留天数", "number", "0 表示关闭清理；默认保留 365 天。", min=0, max=3650, group="基础"),
             field("alerts_enabled", "启用告警", "boolean", "关闭后不会产生新的告警事件。", group="告警"),
             field("alert_recovery_notify", "恢复后通知", "boolean", "异常恢复时是否发送恢复提示。", group="告警"),
-            field("alert_cooldown_seconds", "重复提醒冷却（秒）", "number", "同一个异常多久后才再次提醒。", min=0, max=86400, group="告警"),
+            field("alert_cooldown_seconds", "重复提醒冷却（秒）", "number", "流量阈值异常多久后再次提醒；节点离线只在首次触发时提醒。", min=0, max=86400, group="告警"),
             field("alert_window_minutes", "窗口检测范围（分钟）", "number", "用于最近窗口流量阈值。", min=5, max=1440, group="告警"),
             field("alert_node_missing_samples", "节点失败次数阈值", "number", "节点连续采样失败达到这个次数才告警。", min=1, max=20, group="告警"),
             field("alert_silence_windows", "静默时段", note="格式如 23:00-07:00；多个用逗号分隔。", group="告警"),
@@ -4489,7 +4489,13 @@ def apply_alert_candidates(state: dict, candidates: list[dict], now_ts: int, dry
             rec["last_seen"] = now_ts
 
         last_sent = int(rec.get("last_sent", 0) or 0)
-        due = last_sent == 0 or (now_ts - last_sent >= ALERT_COOLDOWN_SECONDS)
+        # 节点离线属于状态型告警：持续离线期间只通知一次，恢复后 active
+        # 记录会被移除，下次再次离线时才重新通知。流量阈值告警仍按冷却时间
+        # 重复提醒，避免长期超阈值时完全失去提示。
+        repeatable = candidate.get("type") != "node_missing"
+        due = last_sent == 0 or (
+            repeatable and now_ts - last_sent >= ALERT_COOLDOWN_SECONDS
+        )
         if due:
             repeated = (not is_new) and last_sent > 0
             events.append({

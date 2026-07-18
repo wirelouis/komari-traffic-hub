@@ -312,6 +312,8 @@ report_schedules（Web 面板应用内推送计划）
 
 告警默认启用节点连续采样失败检测；流量阈值类规则只有在你配置对应阈值后才会触发，避免升级后突然刷屏。
 
+节点连续采样异常在首次达到失败次数阈值时通知一次，持续离线期间不会重复刷屏；节点恢复后会清除告警状态，下次再次离线时重新通知。`ALERT_COOLDOWN_SECONDS` 仅控制持续触发的流量阈值告警多久重复提醒一次。
+
 - `ALERT_TOTAL_WINDOW_BYTES`：最近 `ALERT_WINDOW_MINUTES` 分钟所有节点合计超阈值
 - `ALERT_NODE_WINDOW_BYTES`：最近窗口内单节点超阈值
 - `ALERT_DAILY_TOTAL_BYTES`：今日所有节点合计超阈值
