@@ -347,7 +347,7 @@ class CoreTests(unittest.TestCase):
         self.assertIn("&lt;tag&gt;", normalized)
         self.assertNotIn("<tag>", normalized)
 
-    def test_node_missing_alert_triggers_and_recovers(self):
+    def test_node_missing_only_notifies_after_recovery(self):
         k.save_samples({
             "samples": [
                 {"ts": 1000, "nodes": {}, "skipped": ["node-a(timeout)"]},
@@ -367,12 +367,9 @@ class CoreTests(unittest.TestCase):
         self.assertEqual([c["key"] for c in second], ["node_missing:node-a"])
 
         events = k.apply_alert_candidates(state, second, now_ts=1300)
-        self.assertEqual(events[0]["kind"], "alert")
-        self.assertIn("节点采样异常", events[0]["message"])
-        self.assertIn("节点：<b>node-a</b>", events[0]["message"])
-        self.assertIn("读取节点数据超时", events[0]["message"])
-        self.assertNotIn("node-a(timeout)", events[0]["message"])
+        self.assertEqual(events, [])
         self.assertIn("node_missing:node-a", state["active"])
+        self.assertEqual(state["active"]["node_missing:node-a"]["first_seen"], 1000)
 
         k.save_samples({
             "samples": [
@@ -382,28 +379,10 @@ class CoreTests(unittest.TestCase):
         recovered = k.collect_alert_candidates(state, now_ts=1600)
         events = k.apply_alert_candidates(state, recovered, now_ts=1600)
         self.assertEqual(events[0]["kind"], "recovery")
-        self.assertIn("节点采样已恢复", events[0]["message"])
+        self.assertIn("节点已恢复", events[0]["message"])
         self.assertIn("监控数据已恢复正常", events[0]["message"])
-        self.assertIn("约 5 分钟", events[0]["message"])
+        self.assertIn("离线时长：<b>约 10 分钟</b>", events[0]["message"])
         self.assertEqual(state["active"], {})
-
-    def test_node_missing_empty_reason_is_human_readable(self):
-        event = k._alert_event(
-            "node_missing:node-a",
-            "node_missing",
-            "节点采样异常：node-a",
-            "unused",
-            details={
-                "node_name": "node-a",
-                "failure_count": 2,
-                "failure_reason": "node-a(empty)",
-            },
-        )
-
-        message = k.format_alert_message(event, now_ts=1000)
-
-        self.assertIn("最近一次采样未返回监控数据", message)
-        self.assertNotIn("node-a(empty)", message)
 
     def test_node_missing_does_not_double_count_same_sample(self):
         k.save_samples({
@@ -417,21 +396,22 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(k.collect_alert_candidates(state, now_ts=1010), [])
         self.assertEqual(state["node_skips"]["node-a"]["count"], 1)
 
-    def test_node_missing_alert_does_not_repeat_while_still_offline(self):
+    def test_node_missing_stays_silent_while_offline(self):
         candidate = k._alert_event(
             "node_missing:node-a",
             "node_missing",
             "节点连续采样异常：node-a",
             "still offline",
+            details={"node_name": "node-a", "first_failed_at": 1000},
         )
         state = {"active": {}, "node_skips": {}, "muted_until": 0}
 
         first = k.apply_alert_candidates(state, [candidate], now_ts=1000)
-        self.assertEqual([event["kind"] for event in first], ["alert"])
-        state["active"]["node_missing:node-a"]["last_sent"] = 1000
+        self.assertEqual(first, [])
 
         after_cooldown = k.apply_alert_candidates(state, [candidate], now_ts=4000)
         self.assertEqual(after_cooldown, [])
+        self.assertIn("node_missing:node-a", state["active"])
 
     def test_traffic_alert_still_repeats_after_cooldown(self):
         candidate = k._alert_event("window_total", "window_total", "窗口总流量超阈值", "high")

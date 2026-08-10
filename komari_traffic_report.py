@@ -642,10 +642,10 @@ def current_runtime_config() -> dict:
             field("task_run_retention_days", "任务记录保留天数", "number", "0 表示关闭清理。", min=0, max=3650, group="基础"),
             field("node_daily_usage_retention_days", "每日汇总保留天数", "number", "0 表示关闭清理；默认保留 365 天。", min=0, max=3650, group="基础"),
             field("alerts_enabled", "启用告警", "boolean", "关闭后不会产生新的告警事件。", group="告警"),
-            field("alert_recovery_notify", "恢复后通知", "boolean", "异常恢复时是否发送恢复提示。", group="告警"),
+            field("alert_recovery_notify", "恢复后通知", "boolean", "流量异常恢复或离线节点重新上报时是否发送提示。", group="告警"),
             field("alert_cooldown_seconds", "重复提醒冷却（秒）", "number", "流量阈值异常多久后再次提醒；节点离线只在首次触发时提醒。", min=0, max=86400, group="告警"),
             field("alert_window_minutes", "窗口检测范围（分钟）", "number", "用于最近窗口流量阈值。", min=5, max=1440, group="告警"),
-            field("alert_node_missing_samples", "节点失败次数阈值", "number", "节点连续采样失败达到这个次数才告警。", min=1, max=20, group="告警"),
+            field("alert_node_missing_samples", "节点失败次数阈值", "number", "连续失败达到这个次数后记为离线；离线期间不推送，恢复时通知。", min=1, max=20, group="告警"),
             field("alert_silence_windows", "静默时段", note="格式如 23:00-07:00；多个用逗号分隔。", group="告警"),
             field("alert_total_window_bytes", "窗口总流量阈值", "bytes", "留空或 0 表示关闭；支持 MiB/GiB/TiB。", group="告警"),
             field("alert_node_window_bytes", "窗口单节点阈值", "bytes", "留空或 0 表示关闭；支持 MiB/GiB/TiB。", group="告警"),
@@ -4326,15 +4326,21 @@ def collect_alert_candidates(state: dict, now_ts: int | None = None) -> list[dic
 
         for name, raw in skipped_names.items():
             rec = node_skips.get(name, {})
-            if int(rec.get("last_sample_ts", 0) or 0) == latest_ts:
-                count = int(rec.get("count", 0))
+            previous_count = int(rec.get("count", 0) or 0)
+            same_sample = int(rec.get("last_sample_ts", 0) or 0) == latest_ts
+            if same_sample:
+                count = previous_count
             else:
-                count = int(rec.get("count", 0)) + 1
+                count = previous_count + 1
+            first_failed_at = int(rec.get("first_failed_at", 0) or 0)
+            if (not same_sample and previous_count <= 0) or first_failed_at <= 0:
+                first_failed_at = latest_ts
             node_skips[name] = {
                 "count": count,
                 "last_seen": now_ts,
                 "last_sample_ts": latest_ts,
                 "last_reason": raw,
+                "first_failed_at": first_failed_at,
             }
             if count >= ALERT_NODE_MISSING_SAMPLES:
                 candidates.append(_alert_event(
@@ -4350,6 +4356,7 @@ def collect_alert_candidates(state: dict, now_ts: int | None = None) -> list[dic
                         "node_name": name,
                         "failure_count": count,
                         "failure_reason": raw,
+                        "first_failed_at": first_failed_at,
                     },
                 ))
 
@@ -4458,21 +4465,6 @@ def _node_missing_name(item: dict) -> str:
     return "unknown"
 
 
-def _friendly_node_skip_reason(raw: str) -> str:
-    text = str(raw or "").strip()
-    match = re.search(r"\(([^()]*)\)$", text)
-    code = (match.group(1) if match else text).strip()
-    friendly = {
-        "empty": "最近一次采样未返回监控数据",
-        "timeout": "读取节点数据超时",
-        "bad_resp": "节点接口返回了异常响应",
-        "HTTPError": "节点接口请求失败",
-        "ConnectionError": "无法连接节点接口",
-        "ReadTimeout": "读取节点数据超时",
-    }
-    return friendly.get(code, f"采样失败（{code}）" if code else "采样失败")
-
-
 def _format_alert_duration(seconds: int) -> str:
     seconds = max(0, int(seconds or 0))
     if seconds < 60:
@@ -4488,20 +4480,6 @@ def _format_alert_duration(seconds: int) -> str:
 
 def format_alert_message(event: dict, now_ts: int, repeated: bool = False) -> str:
     ts = datetime.fromtimestamp(now_ts, TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
-    if event.get("type") == "node_missing":
-        details = event.get("details") or {}
-        name = _node_missing_name(event)
-        count = max(1, int(details.get("failure_count", 1) or 1))
-        reason = _friendly_node_skip_reason(details.get("failure_reason", ""))
-        return (
-            "⚠️ <b>节点采样异常</b>\n"
-            f"🖥️ 节点：<b>{_alert_escape(name)}</b>\n"
-            f"🕒 时间：{ts}\n"
-            f"📉 状态：已连续 <b>{count}</b> 次未获取到监控数据\n"
-            f"🔎 原因：{_alert_escape(reason)}\n"
-            "💡 建议：检查 Agent 运行状态、网络连接和节点上报"
-        )
-
     prefix = "⚠️ <b>Komari 告警</b>"
     if repeated:
         prefix = "⚠️ <b>Komari 告警仍在持续</b>"
@@ -4520,11 +4498,11 @@ def format_recovery_message(record: dict, now_ts: int) -> str:
         first_seen = int(record.get("first_seen", now_ts) or now_ts)
         duration = _format_alert_duration(now_ts - first_seen)
         return (
-            "✅ <b>节点采样已恢复</b>\n"
+            "✅ <b>节点已恢复</b>\n"
             f"🖥️ 节点：<b>{_alert_escape(name)}</b>\n"
-            f"🕒 时间：{ts}\n"
-            "🟢 状态：监控数据已恢复正常\n"
-            f"⏱️ 异常持续：{duration}"
+            f"🕒 恢复时间：{ts}\n"
+            f"⏱️ 离线时长：<b>{duration}</b>\n"
+            "🟢 状态：监控数据已恢复正常"
         )
 
     title = record.get("title", "告警")
@@ -4548,12 +4526,15 @@ def apply_alert_candidates(state: dict, candidates: list[dict], now_ts: int, dry
         rec = active.get(key)
         is_new = rec is None
         if rec is None:
+            details = candidate.get("details") or {}
+            detected_at = int(details.get("first_failed_at", 0) or 0)
+            first_seen = detected_at if 0 < detected_at <= now_ts else now_ts
             rec = {
                 "type": candidate.get("type"),
                 "title": candidate.get("title"),
                 "body": candidate.get("body"),
-                "details": candidate.get("details") or {},
-                "first_seen": now_ts,
+                "details": details,
+                "first_seen": first_seen,
                 "last_seen": now_ts,
                 "last_sent": 0,
             }
@@ -4564,14 +4545,13 @@ def apply_alert_candidates(state: dict, candidates: list[dict], now_ts: int, dry
             rec["details"] = candidate.get("details") or {}
             rec["last_seen"] = now_ts
 
+        # 节点缺样只在内部保持 active 状态，离线期间不发送 Telegram。
+        # 恢复采样后由下方 recovery 分支发送一条包含离线时长的汇总通知。
+        if candidate.get("type") == "node_missing":
+            continue
+
         last_sent = int(rec.get("last_sent", 0) or 0)
-        # 节点离线属于状态型告警：持续离线期间只通知一次，恢复后 active
-        # 记录会被移除，下次再次离线时才重新通知。流量阈值告警仍按冷却时间
-        # 重复提醒，避免长期超阈值时完全失去提示。
-        repeatable = candidate.get("type") != "node_missing"
-        due = last_sent == 0 or (
-            repeatable and now_ts - last_sent >= ALERT_COOLDOWN_SECONDS
-        )
+        due = last_sent == 0 or now_ts - last_sent >= ALERT_COOLDOWN_SECONDS
         if due:
             repeated = (not is_new) and last_sent > 0
             events.append({
