@@ -368,6 +368,10 @@ class CoreTests(unittest.TestCase):
 
         events = k.apply_alert_candidates(state, second, now_ts=1300)
         self.assertEqual(events[0]["kind"], "alert")
+        self.assertIn("节点采样异常", events[0]["message"])
+        self.assertIn("节点：<b>node-a</b>", events[0]["message"])
+        self.assertIn("读取节点数据超时", events[0]["message"])
+        self.assertNotIn("node-a(timeout)", events[0]["message"])
         self.assertIn("node_missing:node-a", state["active"])
 
         k.save_samples({
@@ -378,7 +382,28 @@ class CoreTests(unittest.TestCase):
         recovered = k.collect_alert_candidates(state, now_ts=1600)
         events = k.apply_alert_candidates(state, recovered, now_ts=1600)
         self.assertEqual(events[0]["kind"], "recovery")
+        self.assertIn("节点采样已恢复", events[0]["message"])
+        self.assertIn("监控数据已恢复正常", events[0]["message"])
+        self.assertIn("约 5 分钟", events[0]["message"])
         self.assertEqual(state["active"], {})
+
+    def test_node_missing_empty_reason_is_human_readable(self):
+        event = k._alert_event(
+            "node_missing:node-a",
+            "node_missing",
+            "节点采样异常：node-a",
+            "unused",
+            details={
+                "node_name": "node-a",
+                "failure_count": 2,
+                "failure_reason": "node-a(empty)",
+            },
+        )
+
+        message = k.format_alert_message(event, now_ts=1000)
+
+        self.assertIn("最近一次采样未返回监控数据", message)
+        self.assertNotIn("node-a(empty)", message)
 
     def test_node_missing_does_not_double_count_same_sample(self):
         k.save_samples({

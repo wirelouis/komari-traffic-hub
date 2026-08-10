@@ -4280,12 +4280,13 @@ def _alert_escape(value) -> str:
     return telegram_html_escape(value)
 
 
-def _alert_event(key: str, alert_type: str, title: str, body: str) -> dict:
+def _alert_event(key: str, alert_type: str, title: str, body: str, details: dict | None = None) -> dict:
     return {
         "key": key,
         "type": alert_type,
         "title": title,
         "body": body,
+        "details": dict(details or {}),
     }
 
 
@@ -4339,12 +4340,17 @@ def collect_alert_candidates(state: dict, now_ts: int | None = None) -> list[dic
                 candidates.append(_alert_event(
                     f"node_missing:{name}",
                     "node_missing",
-                    f"节点连续采样异常：{name}",
+                    f"节点采样异常：{name}",
                     (
                         f"节点 <b>{_alert_escape(name)}</b> 已连续 "
                         f"<b>{count}</b> 次采样失败。\n"
                         f"最近原因：<code>{_alert_escape(raw)}</code>"
                     ),
+                    details={
+                        "node_name": name,
+                        "failure_count": count,
+                        "failure_reason": raw,
+                    },
                 ))
 
         for name in list(node_skips.keys()):
@@ -4438,8 +4444,64 @@ def collect_alert_candidates(state: dict, now_ts: int | None = None) -> list[dic
     return candidates
 
 
+def _node_missing_name(item: dict) -> str:
+    details = item.get("details") or {}
+    name = str(details.get("node_name") or "").strip()
+    if name:
+        return name
+    key = str(item.get("key") or "")
+    if key.startswith("node_missing:"):
+        return key.split(":", 1)[1] or "unknown"
+    title = str(item.get("title") or "")
+    if "：" in title:
+        return title.rsplit("：", 1)[1].strip() or "unknown"
+    return "unknown"
+
+
+def _friendly_node_skip_reason(raw: str) -> str:
+    text = str(raw or "").strip()
+    match = re.search(r"\(([^()]*)\)$", text)
+    code = (match.group(1) if match else text).strip()
+    friendly = {
+        "empty": "最近一次采样未返回监控数据",
+        "timeout": "读取节点数据超时",
+        "bad_resp": "节点接口返回了异常响应",
+        "HTTPError": "节点接口请求失败",
+        "ConnectionError": "无法连接节点接口",
+        "ReadTimeout": "读取节点数据超时",
+    }
+    return friendly.get(code, f"采样失败（{code}）" if code else "采样失败")
+
+
+def _format_alert_duration(seconds: int) -> str:
+    seconds = max(0, int(seconds or 0))
+    if seconds < 60:
+        return "不足 1 分钟"
+    minutes = max(1, round(seconds / 60))
+    if minutes < 60:
+        return f"约 {minutes} 分钟"
+    hours, remaining_minutes = divmod(minutes, 60)
+    if remaining_minutes == 0:
+        return f"约 {hours} 小时"
+    return f"约 {hours} 小时 {remaining_minutes} 分钟"
+
+
 def format_alert_message(event: dict, now_ts: int, repeated: bool = False) -> str:
     ts = datetime.fromtimestamp(now_ts, TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
+    if event.get("type") == "node_missing":
+        details = event.get("details") or {}
+        name = _node_missing_name(event)
+        count = max(1, int(details.get("failure_count", 1) or 1))
+        reason = _friendly_node_skip_reason(details.get("failure_reason", ""))
+        return (
+            "⚠️ <b>节点采样异常</b>\n"
+            f"🖥️ 节点：<b>{_alert_escape(name)}</b>\n"
+            f"🕒 时间：{ts}\n"
+            f"📉 状态：已连续 <b>{count}</b> 次未获取到监控数据\n"
+            f"🔎 原因：{_alert_escape(reason)}\n"
+            "💡 建议：检查 Agent 运行状态、网络连接和节点上报"
+        )
+
     prefix = "⚠️ <b>Komari 告警</b>"
     if repeated:
         prefix = "⚠️ <b>Komari 告警仍在持续</b>"
@@ -4453,6 +4515,18 @@ def format_alert_message(event: dict, now_ts: int, repeated: bool = False) -> st
 
 def format_recovery_message(record: dict, now_ts: int) -> str:
     ts = datetime.fromtimestamp(now_ts, TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
+    if record.get("type") == "node_missing":
+        name = _node_missing_name(record)
+        first_seen = int(record.get("first_seen", now_ts) or now_ts)
+        duration = _format_alert_duration(now_ts - first_seen)
+        return (
+            "✅ <b>节点采样已恢复</b>\n"
+            f"🖥️ 节点：<b>{_alert_escape(name)}</b>\n"
+            f"🕒 时间：{ts}\n"
+            "🟢 状态：监控数据已恢复正常\n"
+            f"⏱️ 异常持续：{duration}"
+        )
+
     title = record.get("title", "告警")
     return (
         "✅ <b>Komari 告警恢复</b>\n"
@@ -4478,6 +4552,7 @@ def apply_alert_candidates(state: dict, candidates: list[dict], now_ts: int, dry
                 "type": candidate.get("type"),
                 "title": candidate.get("title"),
                 "body": candidate.get("body"),
+                "details": candidate.get("details") or {},
                 "first_seen": now_ts,
                 "last_seen": now_ts,
                 "last_sent": 0,
@@ -4486,6 +4561,7 @@ def apply_alert_candidates(state: dict, candidates: list[dict], now_ts: int, dry
         else:
             rec["title"] = candidate.get("title")
             rec["body"] = candidate.get("body")
+            rec["details"] = candidate.get("details") or {}
             rec["last_seen"] = now_ts
 
         last_sent = int(rec.get("last_sent", 0) or 0)
