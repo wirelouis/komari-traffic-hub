@@ -17,6 +17,7 @@ import concurrent.futures
 import signal
 import secrets
 import threading
+from urllib.parse import urlsplit
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, date, timezone
@@ -2706,6 +2707,81 @@ def telegram_configured() -> bool:
     return bool(str(TELEGRAM_BOT_TOKEN or "").strip() and str(TELEGRAM_CHAT_ID or "").strip())
 
 
+def telegram_get_webhook_info() -> dict:
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN 未设置")
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getWebhookInfo"
+    r = requests.get(url, timeout=TIMEOUT)
+    r.raise_for_status()
+    data = r.json()
+    if not data.get("ok"):
+        raise RuntimeError("Telegram getWebhookInfo returned ok=false")
+    return data
+
+
+def telegram_delete_webhook(drop_pending_updates: bool = False) -> dict:
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN 未设置")
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook"
+    payload = {"drop_pending_updates": bool(drop_pending_updates)}
+    r = requests.post(url, json=payload, timeout=TIMEOUT)
+    r.raise_for_status()
+    data = r.json()
+    if not data.get("ok"):
+        raise RuntimeError("Telegram deleteWebhook returned ok=false")
+    return data
+
+
+def telegram_webhook_host(webhook_url: str) -> str:
+    """Return a safe host-only description; never log webhook paths or secrets."""
+    try:
+        parsed = urlsplit(str(webhook_url or "").strip())
+        return parsed.hostname or "unknown-host"
+    except Exception:
+        return "unknown-host"
+
+
+def clear_active_telegram_webhook(reason: str) -> bool:
+    """Delete an active webhook while preserving queued Telegram updates."""
+    info = telegram_get_webhook_info()
+    result = info.get("result") or {}
+    webhook_url = str(result.get("url", "") or "").strip()
+    if not webhook_url:
+        return False
+
+    logging.warning(
+        "telegram webhook active on host=%s (%s); deleting for long polling",
+        telegram_webhook_host(webhook_url),
+        reason,
+    )
+    telegram_delete_webhook(drop_pending_updates=False)
+    logging.info("telegram webhook deleted; queued updates preserved")
+    return True
+
+
+def ensure_long_polling_mode_clean() -> bool:
+    """listen 模式启动前清理 webhook，避免 setWebhook 和 getUpdates 冲突。"""
+    if not telegram_configured():
+        return False
+    return clear_active_telegram_webhook("startup")
+
+
+def recover_telegram_409_conflict() -> str:
+    """Self-heal webhook conflicts and distinguish them from a second poller."""
+    try:
+        if clear_active_telegram_webhook("getUpdates 409"):
+            return "webhook_removed"
+    except Exception as exc:
+        logging.warning(
+            "failed to inspect/remove telegram webhook after 409: %s",
+            redact_sensitive_data(str(exc)),
+        )
+        return "inspection_failed"
+
+    logging.error("telegram getUpdates 409 with no webhook configured; another poller is active")
+    return "other_poller"
+
+
 def safe_telegram_send(text: str):
     try:
         if telegram_configured():
@@ -4984,9 +5060,26 @@ def get_updates(offset: int | None):
         except requests.HTTPError as e:
             status_code = e.response.status_code if e.response is not None else None
             if status_code == 409:
-                if should_alert("tg_409", 600):
-                    safe_telegram_send("⚠️ Telegram 409 Conflict：可能有另一份实例在拉 getUpdates，请确认旧环境是否已停止。")
-                raise
+                resolution = recover_telegram_409_conflict()
+                last_exc = e
+                if resolution == "webhook_removed":
+                    # Telegram may need a moment to switch delivery modes.
+                    time.sleep(min(backoff, 3.0))
+                    backoff = min(backoff * 2, 20.0)
+                    continue
+
+                if resolution == "other_poller" and should_alert("tg_409", 600):
+                    safe_telegram_send(
+                        "⚠️ Telegram 409 Conflict：Webhook 未启用，确认有另一份实例正在拉取 getUpdates。"
+                        "请停止旧环境，或为每个实例配置独立 Bot Token。"
+                    )
+
+                # A real second poller cannot be fixed locally. Back off here instead of
+                # returning to the outer loop and flooding logs/Bot API.
+                time.sleep(backoff + random.random())
+                backoff = min(backoff * 2, 20.0)
+                continue
+
             if status_code in (429, 500, 502, 503, 504):
                 last_exc = e
                 retry_after = None
@@ -5058,6 +5151,11 @@ def parse_top_scope(text: str):
 def listen_commands():
     ensure_dirs()
     logging.info("Komari traffic bot starting (stat_tz=%s)", STAT_TZ)
+
+    try:
+        ensure_long_polling_mode_clean()
+    except Exception:
+        logging.exception("failed to ensure telegram long polling mode is clean")
 
     # 启动先采一次样；采样是实时统计主链路，不依赖 Telegram/报表推送。
     try:
