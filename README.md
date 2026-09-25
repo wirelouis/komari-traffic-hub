@@ -392,6 +392,12 @@ docker image inspect ghcr.io/wirelouis/komari-traffic-hub:latest --format '{{.Id
 
 检查 `TELEGRAM_BOT_TOKEN` 和 `TELEGRAM_CHAT_ID`。如果是群组，请先把 bot 拉进群并发一条消息，再确认 chat id 是否正确。
 
+### Telegram 409 Conflict
+
+`bot` 服务使用 `getUpdates` 长轮询，因此同一个 Bot Token 只能由一个 `listen` 实例消费，也不能同时配置 Webhook。程序会在启动时检查 Webhook；发现后会自动调用 `deleteWebhook`，并保留 Telegram 中尚未处理的更新。运行期间若 Webhook 被其他平台重新设置，程序也会在收到 409 后自动清理并恢复长轮询。
+
+如果日志提示“no webhook configured; another poller is active”，说明冲突来自另一份 `getUpdates` 实例，而不是 Webhook。请停止旧服务器、旧容器或手动启动的监听进程；需要并行运行多个环境时，应为每个环境配置独立的 `TELEGRAM_BOT_TOKEN`。不要在其他机器人托管平台中复用本项目的 Token。
+
 ### /top 6h 暂时没数据
 
 短窗口排行依赖采样积累，默认每 5 分钟采样一次；刚启动时需要等待一段时间。

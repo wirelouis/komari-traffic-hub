@@ -151,6 +151,80 @@ class CoreTests(unittest.TestCase):
         self.patch_attr("TASK_RUN_RETENTION_DAYS", 90)
         self.patch_attr("NODE_DAILY_USAGE_RETENTION_DAYS", 365)
 
+    @staticmethod
+    def telegram_response(payload, status_code=200):
+        response = types.SimpleNamespace()
+        response.status_code = status_code
+        response.json = lambda: payload
+
+        def raise_for_status():
+            if status_code >= 400:
+                raise k.requests.HTTPError(f"HTTP {status_code}", response=response)
+
+        response.raise_for_status = raise_for_status
+        return response
+
+    def test_long_polling_startup_removes_webhook_without_dropping_updates(self):
+        self.patch_attr("TELEGRAM_BOT_TOKEN", "123456:test-token")
+        self.patch_attr("TELEGRAM_CHAT_ID", "123456789")
+        get_response = self.telegram_response({
+            "ok": True,
+            "result": {"url": "https://hooks.example.test/private/secret-path"},
+        })
+        delete_response = self.telegram_response({"ok": True, "result": True})
+
+        with patch.object(k.requests, "get", return_value=get_response) as get_mock, \
+                patch.object(k.requests, "post", return_value=delete_response) as post_mock, \
+                self.assertLogs(level="WARNING") as logs:
+            self.assertTrue(k.ensure_long_polling_mode_clean())
+
+        get_mock.assert_called_once()
+        post_mock.assert_called_once()
+        self.assertEqual(post_mock.call_args.kwargs["json"], {"drop_pending_updates": False})
+        log_text = "\n".join(logs.output)
+        self.assertIn("hooks.example.test", log_text)
+        self.assertNotIn("secret-path", log_text)
+        self.assertNotIn("test-token", log_text)
+
+    def test_get_updates_409_webhook_self_heals_and_retries(self):
+        self.patch_attr("TELEGRAM_BOT_TOKEN", "123456:test-token")
+        conflict = self.telegram_response({"ok": False}, status_code=409)
+        webhook_info = self.telegram_response({
+            "ok": True,
+            "result": {"url": "https://hooks.example.test/hook/private"},
+        })
+        deleted = self.telegram_response({"ok": True, "result": True})
+        updates = self.telegram_response({"ok": True, "result": []})
+
+        with patch.object(k.requests, "get", side_effect=[conflict, webhook_info, updates]), \
+                patch.object(k.requests, "post", return_value=deleted) as post_mock, \
+                patch.object(k.time, "sleep"):
+            result = k.get_updates(None)
+
+        self.assertEqual(result, {"ok": True, "result": []})
+        post_mock.assert_called_once()
+
+    def test_get_updates_409_without_webhook_does_not_delete(self):
+        self.patch_attr("TELEGRAM_BOT_TOKEN", "123456:test-token")
+        conflict = self.telegram_response({"ok": False}, status_code=409)
+        no_webhook = self.telegram_response({"ok": True, "result": {"url": ""}})
+
+        with patch.object(k.requests, "get", side_effect=[conflict, no_webhook] * 5), \
+                patch.object(k.requests, "post") as post_mock, \
+                patch.object(k, "should_alert", return_value=False), \
+                patch.object(k.time, "sleep"):
+            with self.assertRaises(k.requests.HTTPError):
+                k.get_updates(None)
+
+        post_mock.assert_not_called()
+
+    def test_409_webhook_inspection_failure_is_bounded(self):
+        self.patch_attr("TELEGRAM_BOT_TOKEN", "123456:test-token")
+        with patch.object(k, "telegram_get_webhook_info", side_effect=RuntimeError("api unavailable")), \
+                patch.object(k, "telegram_delete_webhook") as delete_mock:
+            self.assertEqual(k.recover_telegram_409_conflict(), "inspection_failed")
+        delete_mock.assert_not_called()
+
     def test_parse_bytes_value_supports_units(self):
         self.assertEqual(k.parse_bytes_value(""), 0)
         self.assertEqual(k.parse_bytes_value("1024"), 1024)
@@ -230,21 +304,33 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(calls[0][1], {"timeout": 50, "offset": 123})
         sleep_mock.assert_called_once_with(1.0)
 
-    def test_get_updates_409_conflict_is_not_retried(self):
+    def test_get_updates_409_other_poller_retries_with_bounded_backoff(self):
         sent = []
+        alert_checks = 0
+
+        def throttled_alert(_key, _seconds):
+            nonlocal alert_checks
+            alert_checks += 1
+            return alert_checks == 1
 
         self.patch_attr("TELEGRAM_BOT_TOKEN", "token")
         self.patch_attr("safe_telegram_send", lambda text: sent.append(text))
-        self.patch_attr("should_alert", lambda _key, _seconds: True)
+        self.patch_attr("should_alert", throttled_alert)
 
-        with patch.object(k.requests, "get", return_value=FakeTelegramResponse(409)), \
+        with patch.object(k.requests, "get", return_value=FakeTelegramResponse(409)) as get_mock, \
+             patch.object(k, "recover_telegram_409_conflict", return_value="other_poller"), \
+             patch.object(k.random, "random", return_value=0), \
              patch.object(k.time, "sleep") as sleep_mock:
             with self.assertRaises(k.requests.HTTPError):
                 k.get_updates(None)
 
+        self.assertEqual(get_mock.call_count, 5)
         self.assertEqual(len(sent), 1)
         self.assertIn("409 Conflict", sent[0])
-        sleep_mock.assert_not_called()
+        self.assertEqual(
+            [call.args[0] for call in sleep_mock.call_args_list],
+            [1.0, 2.0, 4.0, 8.0, 16.0],
+        )
 
     def test_silence_window_supports_cross_midnight(self):
         late = datetime(2026, 6, 6, 23, 30, tzinfo=k.TZ)
