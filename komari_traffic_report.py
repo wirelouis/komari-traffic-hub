@@ -5039,6 +5039,33 @@ def is_admin(chat_id: str) -> bool:
 
 # -------------------- Telegram 命令监听 --------------------
 
+class TelegramPollingTransientError(Exception):
+    """getUpdates exhausted retries on a temporary transport/server failure."""
+
+
+class TelegramPollFailureTracker:
+    """Alert once per sustained outage, and re-arm after a successful poll."""
+
+    def __init__(self):
+        self.count = 0
+        self.since = None
+        self.alerted = False
+
+    def failed(self, now: float) -> bool:
+        if self.since is None:
+            self.since = now
+        self.count += 1
+        if not self.alerted and self.count >= 3 and now - self.since >= 300:
+            self.alerted = True
+            return True
+        return False
+
+    def recovered(self):
+        self.count = 0
+        self.since = None
+        self.alerted = False
+
+
 def get_updates(offset: int | None):
     """
     Telegram long polling 在公网环境下偶发被对端 reset 是正常的。
@@ -5054,7 +5081,7 @@ def get_updates(offset: int | None):
     last_exc = None
     for _ in range(5):
         try:
-            r = requests.get(url, params=params, timeout=55)
+            r = requests.get(url, params=params, timeout=(10, 70))
             r.raise_for_status()
             return r.json()
         except requests.HTTPError as e:
@@ -5080,7 +5107,7 @@ def get_updates(offset: int | None):
                 backoff = min(backoff * 2, 20.0)
                 continue
 
-            if status_code in (429, 500, 502, 503, 504):
+            if status_code == 429 or (status_code is not None and 500 <= status_code < 600):
                 last_exc = e
                 retry_after = None
                 if e.response is not None:
@@ -5104,7 +5131,16 @@ def get_updates(offset: int | None):
             backoff = min(backoff * 2, 20.0)
             continue
 
-    # 连续失败才抛出，让外层限频告警接管
+    # Only known transient failures use the quiet outage policy.
+    # 429, 4xx, conflicts and unexpected failures retain the diagnostic path.
+    if isinstance(last_exc, (requests.exceptions.ConnectionError,
+                             requests.exceptions.ReadTimeout,
+                             requests.exceptions.ChunkedEncodingError)) or (
+        isinstance(last_exc, requests.HTTPError)
+        and last_exc.response is not None
+        and 500 <= last_exc.response.status_code < 600
+    ):
+        raise TelegramPollingTransientError(redact_sensitive_data(str(last_exc))) from last_exc
     raise last_exc
 
 
@@ -5183,6 +5219,7 @@ def listen_commands():
         )
     offset = load_offset()
     start_report_scheduler()
+    polling_failures = TelegramPollFailureTracker()
 
     _last_config_mtime = None
     while True:
@@ -5208,10 +5245,22 @@ def listen_commands():
             logging.exception("failed to check/reload runtime config")
 
         try:
-            data = get_updates(offset)
+            try:
+                data = get_updates(offset)
+            except TelegramPollingTransientError as e:
+                if polling_failures.failed(time.monotonic()):
+                    safe_telegram_send(
+                        "⚠️ Telegram getUpdates 持续不可用：连续轮询失败至少 3 次、"
+                        "持续至少 5 分钟。流量采样继续运行；本次故障仅告警一次，恢复后重新监测。"
+                    )
+                logging.warning("Telegram getUpdates temporary failure (%d exhausted polls): %s",
+                                polling_failures.count, redact_sensitive_data(str(e)))
+                time.sleep(min(5 * polling_failures.count, 30))
+                continue
             if not data.get("ok"):
                 time.sleep(3)
                 continue
+            polling_failures.recovered()
 
             for upd in data.get("result", []):
                 update_id = upd.get("update_id")
