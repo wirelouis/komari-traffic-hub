@@ -218,6 +218,47 @@ class CoreTests(unittest.TestCase):
 
         post_mock.assert_not_called()
 
+    def test_get_updates_transient_exhaustion_and_timeout(self):
+        self.patch_attr("TELEGRAM_BOT_TOKEN", "123456:test-token")
+        for failure in (k.requests.exceptions.ReadTimeout("slow"),
+                        k.requests.exceptions.ConnectionError("disconnect"),
+                        k.requests.HTTPError("502", response=FakeTelegramResponse(502))):
+            if isinstance(failure, k.requests.HTTPError):
+                response = FakeTelegramResponse(502)
+                request_result = response
+            else:
+                request_result = failure
+            with self.subTest(failure=type(failure).__name__), \
+                    patch.object(k.requests, "get", side_effect=(None if isinstance(failure, k.requests.HTTPError) else failure),
+                                 return_value=(request_result if isinstance(failure, k.requests.HTTPError) else None)) as get_mock, \
+                    patch.object(k.time, "sleep"):
+                with self.assertRaises(k.TelegramPollingTransientError):
+                    k.get_updates(12)
+                self.assertEqual(get_mock.call_count, 5)
+                self.assertEqual(get_mock.call_args.kwargs["timeout"], (10, 70))
+                self.assertEqual(get_mock.call_args.kwargs["params"]["timeout"], 50)
+
+    def test_get_updates_4xx_and_unknown_errors_remain_diagnostic(self):
+        self.patch_attr("TELEGRAM_BOT_TOKEN", "123456:test-token")
+        with patch.object(k.requests, "get", return_value=FakeTelegramResponse(403)):
+            with self.assertRaises(k.requests.HTTPError):
+                k.get_updates(None)
+        with patch.object(k.requests, "get", side_effect=ValueError("unexpected")):
+            with self.assertRaises(ValueError):
+                k.get_updates(None)
+
+    def test_poll_failure_alerts_once_and_resets_on_recovery(self):
+        tracker = k.TelegramPollFailureTracker()
+        self.assertFalse(tracker.failed(0))
+        self.assertFalse(tracker.failed(150))
+        self.assertFalse(tracker.failed(299))
+        self.assertTrue(tracker.failed(300))
+        self.assertFalse(tracker.failed(3600))
+        tracker.recovered()
+        self.assertFalse(tracker.failed(4000))
+        self.assertFalse(tracker.failed(4300))
+        self.assertTrue(tracker.failed(4301))
+
     def test_409_webhook_inspection_failure_is_bounded(self):
         self.patch_attr("TELEGRAM_BOT_TOKEN", "123456:test-token")
         with patch.object(k, "telegram_get_webhook_info", side_effect=RuntimeError("api unavailable")), \
